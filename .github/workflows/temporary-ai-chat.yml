@@ -1,0 +1,183 @@
+name: USB Uncensored LLM - Temporary Web Chat
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ollama model (7B is the largest practical default for this runner)"
+        required: true
+        default: "qwen2.5:7b"
+        type: choice
+        options:
+          - qwen2.5:7b
+          - qwen2.5:3b
+          - gemma2:2b
+      run_minutes:
+        description: "How long to keep the temporary chat online (minutes)"
+        required: true
+        default: "330"
+        type: choice
+        options:
+          - "30"
+          - "60"
+          - "120"
+          - "240"
+          - "330"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: usb-uncensored-temporary-chat
+  cancel-in-progress: true
+
+jobs:
+  chat:
+    # Public-repository standard runner: typically 4 CPU / 16 GB RAM.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Check required password secret
+        env:
+          CHAT_PASSWORD: ${{ secrets.CHAT_PASSWORD }}
+        run: |
+          if [ -z "$CHAT_PASSWORD" ]; then
+            echo "::error::Add a repository Actions secret named CHAT_PASSWORD before running this workflow."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner capacity
+        run: |
+          echo "Runner resources:"
+          nproc
+          free -h
+          df -h /
+
+      - name: Install Ollama and system tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates nginx apache2-utils python3
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl enable --now ollama
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+
+      - name: Pull selected model
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          # Keep model storage on the runner's normal disk; the runner is temporary.
+          ollama pull "$MODEL"
+          ollama list
+          # Quick smoke test: fail early if inference does not work.
+          ollama run "$MODEL" "Reply with exactly: MODEL_READY"
+
+      - name: Start repository chat server
+        run: |
+          set -euo pipefail
+          # Existing server proxies requests to the local Ollama API and listens on 0.0.0.0:3333.
+          python3 Shared/chat_server.py > /tmp/usb-chat-server.log 2>&1 &
+          echo $! > /tmp/usb-chat-server.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3333/ >/dev/null; then
+              echo "Chat server is responding."
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/usb-chat-server.log
+          exit 1
+
+      - name: Protect web chat with HTTP Basic Auth
+        env:
+          CHAT_PASSWORD: ${{ secrets.CHAT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Nginx fronts the app; never expose the unauthenticated app port through the tunnel.
+          printf '%s' "$CHAT_PASSWORD" | sudo htpasswd -ci /etc/nginx/.chat_users chatuser
+          sudo tee /etc/nginx/sites-available/usb-chat >/dev/null <<'NGINX'
+          server {
+              listen 127.0.0.1:3334;
+              server_name _;
+              auth_basic "Temporary AI Chat";
+              auth_basic_user_file /etc/nginx/.chat_users;
+              client_max_body_size 20m;
+              location / {
+                  proxy_pass http://127.0.0.1:3333;
+                  proxy_http_version 1.1;
+                  proxy_buffering off;
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+          NGINX
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo ln -sf /etc/nginx/sites-available/usb-chat /etc/nginx/sites-enabled/usb-chat
+          sudo nginx -t
+          sudo systemctl restart nginx
+          curl -fsSI http://127.0.0.1:3334/ | grep -qi '401 Unauthorized'
+
+      - name: Start temporary Cloudflare tunnel
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) CF_ARCH=amd64 ;;
+            aarch64|arm64) CF_ARCH=arm64 ;;
+            *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /tmp/cloudflared
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3334 > /tmp/cloudflared.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          for i in $(seq 1 90); do
+            URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)"
+            if [ -n "$URL" ]; then
+              echo "Temporary chat URL: $URL"
+              echo "Login username: chatuser"
+              echo "Password: the CHAT_PASSWORD secret you configured in repository settings (not printed here)."
+              echo "Open the URL in your phone browser; HTTP Basic Auth will prompt for credentials."
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/cloudflared.log
+          echo "::error::Cloudflare tunnel did not provide a URL."
+          exit 1
+
+      - name: Keep chat alive
+        env:
+          RUN_MINUTES: ${{ inputs.run_minutes }}
+        run: |
+          set -euo pipefail
+          echo "Chat will remain online for up to $RUN_MINUTES minutes or until the workflow is stopped."
+          # Check the tunnel and app periodically; fail if the service dies.
+          for ((i=0; i<RUN_MINUTES; i++)); do
+            if ! curl -fsS http://127.0.0.1:3333/ >/dev/null; then
+              echo "::error::Chat server stopped responding."
+              cat /tmp/usb-chat-server.log || true
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "Requested session duration finished."
+
+      - name: Diagnostic logs
+        if: always()
+        run: |
+          echo "=== Chat server log (last 150 lines) ==="
+          tail -n 150 /tmp/usb-chat-server.log 2>/dev/null || true
+          echo "=== Cloudflare tunnel log (last 100 lines) ==="
+          tail -n 100 /tmp/cloudflared.log 2>/dev/null || true
