@@ -127,7 +127,8 @@ jobs:
           sudo ln -sf /etc/nginx/sites-available/usb-chat /etc/nginx/sites-enabled/usb-chat
           sudo nginx -t
           sudo systemctl restart nginx
-          curl -fsSI http://127.0.0.1:3334/ | grep -qi '401 Unauthorized'
+          STATUS="$(curl -sSI -o /tmp/auth_headers -w '%{http_code}' http://127.0.0.1:3334/)"
+          test "$STATUS" = "401" || { cat /tmp/auth_headers; echo "Expected unauthenticated request to return 401, got $STATUS"; exit 1; }
 
       - name: Start temporary Cloudflare tunnel
         run: |
